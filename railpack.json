@@ -1,11 +1,8 @@
 {
-  "packages": ["python311"],
-  "steps": {
-    "install": {
-      "cmds": ["pip install -r requirements.txt"]
-    }
+  "packages": {
+    "python": "3.11"
   },
   "deploy": {
-    "startCmd": "python projects.py"
+    "startCommand": "python projects.py"
   }
 }
