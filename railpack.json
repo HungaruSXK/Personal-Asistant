@@ -3,6 +3,6 @@
     "python": "3.11"
   },
   "deploy": {
-    "startCommand": "projects.py"
+    "startCommand": "python projects.py"
   }
 }
