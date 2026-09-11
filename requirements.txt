@@ -1,5 +1,1 @@
-discord.py
-python-dotenv
-requests
-customtkinter
-faster-whisper
+discord.py>=2.3
