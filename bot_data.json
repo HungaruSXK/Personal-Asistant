@@ -1,0 +1,47 @@
+{
+  "clients": {
+    "The Fifth Avenue": {
+      "name": "The Fifth Avenue",
+      "logo": null,
+      "role_id": 1547548135205765190
+    },
+    "Allurea": {
+      "name": "Allurea",
+      "logo": null,
+      "role_id": 1547548182265856080
+    },
+    "Aterium": {
+      "name": "Aterium",
+      "logo": null,
+      "role_id": 1547548222166409231
+    },
+    "Raya Residences": {
+      "name": "Raya Residences",
+      "logo": null,
+      "role_id": 1547548336418984006
+    },
+    "Olympus 2": {
+      "name": "Olympus 2",
+      "logo": null,
+      "role_id": 1547548372003463298
+    },
+    "Fractional": {
+      "name": "Fractional",
+      "logo": null,
+      "role_id": 1547548398029377637
+    }
+  },
+  "tokens": {},
+  "threads": {},
+  "feedback": [],
+  "clock_state": {
+    "719071676679061514": {
+      "in": "2026-09-11T08:40:50.453607+08:00",
+      "overtime_prompted": false,
+      "overtime_confirmed": false
+    }
+  },
+  "clock_entries": [],
+  "deliver_channel_id": null,
+  "authorized_timesheet_roles": []
+}
