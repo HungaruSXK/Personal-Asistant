@@ -46,10 +46,13 @@ DATA_FILE = "bot_data.json"
 
 # ----------------------------- STORAGE -----------------------------
 DEFAULT_DATA = {
-    "clients":   {},   # name -> {name, logo, role_id}
+    "clients":   {},   # name -> {name, logo, role_id, assigned_staff: None}
     "tokens":    {},   # TOKEN  -> {client, content, attachment, thread_id, user_id, used, created_at}
-    "threads":   {},   # thread_id -> {client, user_id, closed, reopen_until}
+    "threads":   {},   # thread_id -> {client, user_id, closed, reopen_until, status: "Pending"}
     "feedback":  [],   # [{thread_id, client, author, content, at}]
+    "ratings":   [],   # [{user_id, client, rating, at}]
+    "onboarding": {},  # user_id -> {company, industry, goal}
+    "milestones": [],  # [{thread_id, content, status, at}]
     "clock_state": {}, # user_id -> {in, overtime_prompted, overtime_confirmed}
     "clock_entries": [],  # [{user_id, date, in, out, minutes, overtime}]
     "deliver_channel_id": None,
@@ -109,6 +112,86 @@ async def get_deliver_channel(guild: discord.Guild) -> discord.TextChannel:
 def thread_of(interaction: discord.Interaction):
     tid = str(interaction.channel.id)
     return data["threads"].get(tid)
+
+class MilestoneView(discord.ui.View):
+    def __init__(self, staff_id: int, client_name: str, content: str):
+        super().__init__(timeout=None)
+        self.staff_id = staff_id
+        self.client_name = client_name
+        self.content = content
+
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Only client should approve
+        th = thread_of(interaction)
+        if not th or interaction.user.id != th.get("user_id"):
+            return await interaction.response.send_message("⛔ Only the client can approve this milestone.", ephemeral=True)
+
+        # Log milestone
+        data["milestones"].append({
+            "thread_id": interaction.channel.id,
+            "content": self.content,
+            "status": "Approved",
+            "at": wita_now().isoformat()})
+        save_data()
+
+        await interaction.response.edit_message(content=f"✅ **Milestone Approved by {interaction.user.mention}**\n\n{self.content}", view=None)
+
+        # Notify staff
+        staff = bot.get_user(self.staff_id) or await bot.fetch_user(self.staff_id)
+        try:
+            await staff.send(f"🎉 Milestone approved for **{self.client_name}**!\n\n{self.content}")
+        except discord.Forbidden:
+            pass
+
+    @discord.ui.button(label="❌ Request Revision", style=discord.ButtonStyle.danger)
+    async def revise(self, interaction: discord.Interaction, button: discord.ui.Button):
+        th = thread_of(interaction)
+        if not th or interaction.user.id != th.get("user_id"):
+            return await interaction.response.send_message("⛔ Only the client can request revisions.", ephemeral=True)
+
+        await interaction.response.edit_message(content=f"❌ **Revision Requested by {interaction.user.mention}**\n\n{self.content}\n\n*Staff will be notified to make changes.*", view=None)
+
+        # Notify staff
+        staff = bot.get_user(self.staff_id) or await bot.fetch_user(self.staff_id)
+        try:
+            await staff.send(f"⚠️ Revision requested for **{self.client_name}** milestone:\n\n{self.content}")
+        except discord.Forbidden:
+            pass
+
+class RatingView(discord.ui.View):
+    def __init__(self, client_name: str):
+        super().__init__(timeout=None)
+        self.client_name = client_name
+
+    async def handle_rating(self, interaction: discord.Interaction, rating: int):
+        data["ratings"].append({
+            "user_id": interaction.user.id,
+            "client": self.client_name,
+            "rating": rating,
+            "at": wita_now().isoformat()})
+        save_data()
+        await interaction.response.edit_message(content=f"⭐ Thank you for your feedback! You rated us {rating}/5.", view=None)
+
+    @discord.ui.button(label="1 ⭐", style=discord.ButtonStyle.danger)
+    async def rate_1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_rating(interaction, 1)
+
+    @discord.ui.button(label="2 ⭐", style=discord.ButtonStyle.danger)
+    async def rate_2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_rating(interaction, 2)
+
+    @discord.ui.button(label="3 ⭐", style=discord.ButtonStyle.secondary)
+    async def rate_3(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_rating(interaction, 3)
+
+    @discord.ui.button(label="4 ⭐", style=discord.ButtonStyle.success)
+    async def rate_4(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_rating(interaction, 4)
+
+    @discord.ui.button(label="5 ⭐", style=discord.ButtonStyle.success)
+    async def rate_5(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_rating(interaction, 5)
 
 # ----------------------------- OVERTIME VIEW -----------------------------
 class OvertimeView(discord.ui.View):
@@ -200,6 +283,14 @@ async def reopen_watcher():
                 except discord.HTTPException:
                     pass
 
+async def start_onboarding(member: discord.Member):
+    """Initiates the onboarding sequence via DMs."""
+    data["onboarding"][str(member.id)] = {"step": "company"}
+    try:
+        await member.send("Welcome! To get started, please tell us your **Company Name**.")
+    except discord.Forbidden:
+        pass
+
 async def process_token_redemption(member: discord.Member, token: str, guild: discord.Guild) -> discord.Thread | None:
     """
     Core logic for redeeming an access token.
@@ -261,6 +352,10 @@ async def process_token_redemption(member: discord.Member, token: str, guild: di
     tinfo["user_id"] = member.id
     tinfo["thread_id"] = thread.id
     save_data()
+
+    # Trigger Onboarding
+    await start_onboarding(member)
+
     return thread
 
 # ----------------------------- EVENTS -----------------------------
@@ -357,6 +452,37 @@ async def purge(interaction: discord.Interaction, amount: int):
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
 # ----------------------------- ADMIN: CLIENTS -----------------------------
+@bot.tree.command(name="assignstaff", description="[Admin] Assign a staff member to a client")
+@app_commands.describe(client="Client name", staff="The staff member to assign")
+async def assignstaff(interaction: discord.Interaction, client: str, staff: discord.Member):
+    if not is_admin(interaction.user.id):
+        return await interaction.response.send_message("⛔ Admin only.", ephemeral=True)
+
+    client = client.strip()
+    if client not in data["clients"]:
+        return await interaction.response.send_message(f"⚠️ Unknown client. Registered: {', '.join(data['clients']) or 'none'}", ephemeral=True)
+
+    # Update data
+    data["clients"][client]["assigned_staff"] = staff.id
+    save_data()
+
+    # Add staff to client thread if it exists
+    guild = interaction.guild
+    # We need to find the thread for this client.
+    # Threads are stored by id -> {client, ...}
+    target_tid = None
+    for tid, th in data["threads"].items():
+        if th["client"] == client:
+            target_tid = tid
+            break
+
+    if target_tid:
+        thread = guild.get_thread(int(target_tid))
+        if thread:
+            await thread.add_user(staff)
+
+    await interaction.response.send_message(f"✅ Assigned {staff.mention} as the account manager for **{client}**.")
+
 @bot.tree.command(name="addclient", description="[Admin] Register a client (creates their role)")
 @app_commands.describe(name="Client name/label (e.g. A, B, Acme Corp)", logo="Logo image URL (optional)")
 async def addclient(interaction: discord.Interaction, name: str, logo: str = None):
@@ -490,6 +616,42 @@ def thread_permission(interaction) -> bool:
     th = thread_of(interaction)
     return th and (is_admin(interaction.user.id) or interaction.user.id == th["user_id"])
 
+@bot.tree.command(name="status", description="Update the status of the delivery thread")
+@app_commands.describe(status="New status for the ticket")
+@app_commands.choices(status=[
+    app_commands.Choice(name="Pending", value="Pending"),
+    app_commands.Choice(name="In Progress", value="In Progress"),
+    app_commands.Choice(name="Resolved", value="Resolved"),
+])
+async def status_cmd(interaction: discord.Interaction, status: app_commands.Choice[str]):
+    th = thread_of(interaction)
+    if not th or not isinstance(interaction.channel, discord.Thread):
+        return await interaction.response.send_message("⚠️ Use this inside a delivery thread.", ephemeral=True)
+
+    # Restricted to Staff/Admin
+    is_authorized = is_admin(interaction.user.id)
+    if not is_authorized:
+        client_name = th["client"]
+        staff_id = data["clients"].get(client_name, {}).get("assigned_staff")
+        if staff_id == interaction.user.id:
+            is_authorized = True
+
+    if not is_authorized:
+        return await interaction.response.send_message("⛔ Only the assigned staff or admin can change the status.", ephemeral=True)
+
+    # Update status
+    th["status"] = status.value
+    save_data()
+
+    # Update thread name
+    new_name = f"[{status.value}] {th['client']} · {interaction.guild.get_member(th['user_id']).name if th['user_id'] else 'Client'}"
+    try:
+        await interaction.channel.edit(name=new_name)
+    except discord.HTTPException:
+        pass
+
+    await interaction.response.send_message(f"✅ Thread status updated to **{status.value}**.")
+
 @bot.tree.command(name="close", description="Close your delivery thread (client or admin)")
 async def close(interaction: discord.Interaction):
     th = thread_of(interaction)
@@ -502,6 +664,19 @@ async def close(interaction: discord.Interaction):
     save_data()
     await interaction.response.send_message("🔒 Closing this thread. Message the server (or admin) to reopen temporarily.")
     await interaction.channel.edit(locked=True, archived=True)
+
+    # CSAT Trigger
+    client_name = th["client"]
+    user_id = th["user_id"]
+    if user_id:
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+        try:
+            await user.send(
+                f"Hello! Your thread for **{client_name}** has been closed.\n"
+                f"We'd love to hear your feedback! How would you rate our service?",
+                view=RatingView(client_name))
+        except discord.Forbidden:
+            pass
 
 @bot.tree.command(name="open", description="Temporarily reopen a closed delivery thread")
 @app_commands.describe(minutes="How long to stay open (default 30, max 180)")
@@ -526,6 +701,36 @@ def log_feedback(thread_id: str, client: str, author, content: str):
         "author": f"{author} ({author.id})", "content": content,
         "at": wita_now().isoformat()})
     save_data()
+
+@bot.tree.command(name="milestone", description="Post a milestone for client approval")
+@app_commands.describe(content="The milestone details for the client to approve")
+async def milestone(interaction: discord.Interaction, content: str):
+    th = thread_of(interaction)
+    if not th or not isinstance(interaction.channel, discord.Thread):
+        return await interaction.response.send_message("⚠️ Use this inside a delivery thread.", ephemeral=True)
+
+    # Restricted to Staff/Admin
+    is_authorized = is_admin(interaction.user.id)
+    if not is_authorized:
+        client_name = th["client"]
+        staff_id = data["clients"].get(client_name, {}).get("assigned_staff")
+        if staff_id == interaction.user.id:
+            is_authorized = True
+
+    if not is_authorized:
+        return await interaction.response.send_message("⛔ Only the assigned staff or admin can post milestones.", ephemeral=True)
+
+    staff_id = interaction.user.id # The person posting is the current manager
+    client_name = th["client"]
+
+    embed = discord.Embed(
+        title="🚩 Milestone for Approval",
+        description=content,
+        color=discord.Color.gold(),
+        timestamp=wita_now())
+    embed.set_footer(text="Please Approve or Request Revision using the buttons below.")
+
+    await interaction.response.send_message(content=f"{interaction.guild.get_member(th['user_id']).mention if th['user_id'] else 'Client'}, please review the following milestone:", embed=embed, view=MilestoneView(staff_id, client_name, content))
 
 @bot.tree.command(name="feedback", description="Submit formal feedback in your delivery thread")
 @app_commands.describe(message="Your feedback")
@@ -558,6 +763,72 @@ async def on_message_feedback(message: discord.Message):
 _orig_on_message = on_message
 async def _wrapped_on_message(message: discord.Message):
     if not message.author.bot:
+        # Onboarding Handler
+        uid_str = str(message.author.id)
+        if uid_str in data["onboarding"]:
+            state = data["onboarding"][uid_str]
+            step = state["step"]
+
+            if step == "company":
+                state["company"] = message.content.strip()
+                state["step"] = "industry"
+                save_data()
+                try:
+                    await message.author.send("Got it! Now, what is your **Industry**?")
+                except discord.Forbidden:
+                    pass
+                return
+
+            elif step == "industry":
+                state["industry"] = message.content.strip()
+                state["step"] = "goal"
+                save_data()
+                try:
+                    await message.author.send("Almost there! Finally, what is your **Primary Goal** with us?")
+                except discord.Forbidden:
+                    pass
+                return
+
+            elif step == "goal":
+                state["goal"] = message.content.strip()
+                save_data()
+                # Store in clients data if possible
+                # Find which client this user belongs to
+                client_name = None
+                for tid, th in data["threads"].items():
+                    if th.get("user_id") == message.author.id:
+                        client_name = th["client"]
+                        break
+
+                if client_name and client_name in data["clients"]:
+                    data["clients"][client_name]["onboarding_data"] = state
+                    save_data()
+
+                try:
+                    await message.author.send("✅ Thank you! Your onboarding is complete. Your account manager will be in touch soon.")
+                except discord.Forbidden:
+                    pass
+                data["onboarding"].pop(uid_str)
+                save_data()
+                return
+
+        # Staff Notification System
+        if isinstance(message.channel, discord.Thread):
+            tid = str(message.channel.id)
+            th = data["threads"].get(tid)
+            if th:
+                client_name = th["client"]
+                staff_id = data["clients"].get(client_name, {}).get("assigned_staff")
+                if staff_id and staff_id != message.author.id:
+                    staff = bot.get_user(staff_id) or await bot.fetch_user(staff_id)
+                    try:
+                        await staff.send(
+                            f"🔔 Your client **{client_name}** just sent a message in their thread!\n"
+                            f"👉 {message.channel.jump_url}")
+                    except discord.Forbidden:
+                        pass
+
+        # Informal Feedback Log
         th = data["threads"].get(str(message.channel.id)) if isinstance(message.channel, discord.Thread) else None
         if th and not message.content.startswith("/"):
             log_feedback(str(message.channel.id), th["client"], message.author, message.content)
