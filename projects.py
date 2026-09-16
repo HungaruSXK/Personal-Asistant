@@ -200,48 +200,21 @@ async def reopen_watcher():
                 except discord.HTTPException:
                     pass
 
-# ----------------------------- EVENTS -----------------------------
-@bot.event
-async def on_ready():
-    guild = bot.get_guild(GUILD_ID)
-    if guild:
-        bot.tree.copy_global_to(guild=discord.Object(id=GUILD_ID))
-        await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
-    overtime_watcher.start()
-    reopen_watcher.start()
-    print(f"[OK] Logged in as {bot.user} — WITA time: {wita_now().strftime('%Y-%m-%d %H:%M')}")
-
-@bot.event
-async def on_member_join(member: discord.Member):
-    try:
-        await member.send(
-            f"👋 Welcome to **{member.guild.name}**!\n\n"
-            f"You need an access token to receive your private content.\n"
-            f"👉 **Just reply here with the token** your provider gave you.")
-    except discord.Forbidden:
-        pass
-
-@bot.event
-async def on_message(message: discord.Message):
-    # ---- TOKEN REDEMPTION (works in DM or any channel) ----
-    if message.author.bot:
-        return
-    token = message.content.strip().upper()
+async def process_token_redemption(member: discord.Member, token: str, guild: discord.Guild) -> discord.Thread | None:
+    """
+    Core logic for redeeming an access token.
+    Returns the thread if successful, None otherwise.
+    """
     tinfo = data["tokens"].get(token)
     if not tinfo or tinfo.get("used"):
-        await bot.process_commands(message)
-        return
+        return None
 
-    guild = bot.get_guild(GUILD_ID)
-    if guild is None:
-        return
-    member = guild.get_member(message.author.id) or await guild.fetch_member(message.author.id)
+    client_name = tinfo["client"]
+    if client_name not in data["clients"]:
+        return None
+    client = data["clients"][client_name]
 
-    tinfo["used"] = True
-    tinfo["user_id"] = member.id
-    client = data["clients"][tinfo["client"]]
-
-    # role per client
+    # Assign role per client
     role = guild.get_role(client["role_id"])
     if role is None:
         role = await guild.create_role(name=f"Client · {client['name']}", mentionable=True)
@@ -252,15 +225,10 @@ async def on_message(message: discord.Message):
         # ===== TOKEN UNLOCKS AN EXISTING PRIVATE THREAD =====
         thread = guild.get_thread(int(tinfo["thread_id"]))
         if thread is None:
-            tinfo["used"] = False  # refund the token
-            save_data()
-            try:
-                await message.author.send("❌ This token's thread no longer exists. Please contact the admin.")
-            except discord.Forbidden:
-                pass
-            return
+            return None
         await thread.add_user(member)
         try:
+            await thread.edit(name=f"{client['name']} · {member.name}")
             await thread.send(f"🔓 {member.mention} joined via access token `{token}`.")
         except discord.HTTPException:
             pass
@@ -288,14 +256,55 @@ async def on_message(message: discord.Message):
         data["threads"][str(thread.id)] = {
             "client": client["name"], "user_id": member.id,
             "closed": False, "reopen_until": None}
+
+    tinfo["used"] = True
+    tinfo["user_id"] = member.id
     tinfo["thread_id"] = thread.id
     save_data()
+    return thread
 
+# ----------------------------- EVENTS -----------------------------
+@bot.event
+async def on_ready():
+    guild = bot.get_guild(GUILD_ID)
+    if guild:
+        bot.tree.copy_global_to(guild=discord.Object(id=GUILD_ID))
+        await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+    overtime_watcher.start()
+    reopen_watcher.start()
+    print(f"[OK] Logged in as {bot.user} — WITA time: {wita_now().strftime('%Y-%m-%d %H:%M')}")
+
+@bot.event
+async def on_member_join(member: discord.Member):
     try:
-        await message.author.send(f"✅ Token accepted! Your private thread is ready: {thread.jump_url}")
+        await member.send(
+            f"👋 Welcome to **{member.guild.name}**!\n\n"
+            f"You need an access token to receive your private content.\n"
+            f"👉 **Just reply here with the token** your provider gave you.")
     except discord.Forbidden:
         pass
-    await message.add_reaction("✅")
+
+@bot.event
+async def on_message(message: discord.Message):
+    # ---- TOKEN REDEMPTION (works in DM or any channel) ----
+    if message.author.bot:
+        return
+    token = message.content.strip().upper()
+
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    member = guild.get_member(message.author.id) or await guild.fetch_member(message.author.id)
+
+    thread = await process_token_redemption(member, token, guild)
+    if thread:
+        try:
+            await message.author.send(f"✅ Token accepted! Your private thread is ready: {thread.jump_url}")
+        except discord.Forbidden:
+            pass
+        await message.add_reaction("✅")
+    else:
+        await bot.process_commands(message)
 
 @bot.event
 async def on_thread_remove(thread: discord.Thread):
@@ -388,6 +397,51 @@ async def removeclient(interaction: discord.Interaction, name: str):
     await interaction.response.send_message(f"🗑️ Client **{name}** removed.", ephemeral=True)
 
 # ----------------------------- ADMIN: TOKENS -----------------------------
+@bot.tree.command(name="assign", description="[Admin] Create a private thread for a client and generate a token")
+@app_commands.describe(client="Client name")
+async def assign(interaction: discord.Interaction, client: str):
+    if not is_admin(interaction.user.id):
+        return await interaction.response.send_message("⛔ Admin only.", ephemeral=True)
+    client = client.strip()
+    if client not in data["clients"]:
+        return await interaction.response.send_message(f"⚠️ Unknown client. Registered: {', '.join(data['clients']) or 'none'}", ephemeral=True)
+
+    guild = interaction.guild
+    channel = await get_deliver_channel(guild)
+    thread = await channel.create_thread(
+        name=f"{client} · Pending",
+        type=discord.ChannelType.private_thread,
+        invitable=False)
+
+    token = secrets.token_hex(4).upper()
+    data["tokens"][token] = {
+        "client": client, "content": None, "attachment": None,
+        "thread_id": thread.id,
+        "user_id": None, "used": False,
+        "created_at": wita_now().isoformat()}
+    save_data()
+
+    await interaction.response.send_message(
+        f"🔑 **Token for `{client}`**: `{token}`\n"
+        f"This token is linked to the private thread: {thread.jump_url}\n"
+        f"Send this to your client. It works once via `/redeem` or by DMing the bot.",
+        ephemeral=True)
+
+@bot.tree.command(name="redeem", description="Redeem your access token to join your private thread")
+@app_commands.describe(token="Your access token")
+async def redeem(interaction: discord.Interaction, token: str):
+    # Check if user has any client role
+    has_client_role = any(r.name.startswith("Client · ") for r in interaction.user.roles)
+    if not has_client_role:
+        return await interaction.response.send_message("⛔ You must have a client role to use this command.", ephemeral=True)
+
+    token = token.strip().upper()
+    thread = await process_token_redemption(interaction.user, token, interaction.guild)
+    if thread:
+        await interaction.response.send_message(f"✅ Token redeemed! Your private thread is ready: {thread.jump_url}")
+    else:
+        await interaction.response.send_message("❌ Invalid or already used token.", ephemeral=True)
+
 @bot.tree.command(name="gentoken", description="[Admin] Generate an access token for a client")
 @app_commands.describe(client="Client name", content="The content/ideas to deliver in their thread",
                        attachment="Optional file URL to attach",
